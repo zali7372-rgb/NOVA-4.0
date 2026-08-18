@@ -26,16 +26,22 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
 
         private const val CHANNEL_ID = "nova_voice_channel"
         private const val NOTIFICATION_ID = 1001
+
+        private const val LISTEN_DELAY = 500L
+        private const val ERROR_DELAY = 1200L
+        private const val COMMAND_DELAY = 700L
     }
+
+    private val handler = Handler(Looper.getMainLooper())
 
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
 
     private var running = false
+    private var listening = false
+    private var speaking = false
+    private var processingCommand = false
     private var novaActivated = false
-    private var recognitionStarting = false
-
-    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate() {
         super.onCreate()
@@ -64,18 +70,16 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         when (intent?.action) {
 
             ACTION_START -> {
-                if (!running) {
-                    startListening()
-                }
+                startNova()
             }
 
             ACTION_STOP -> {
-                stopListening()
+                stopNova()
                 stopSelf()
             }
         }
 
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun createNotificationChannel() {
@@ -86,12 +90,12 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
                 CHANNEL_ID,
                 "NOVA hangvezérlés",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description =
-                    "NOVA háttérben futó hangvezérlése"
+            )
 
-                setShowBadge(false)
-            }
+            channel.description =
+                "NOVA háttérben futó hangvezérlése"
+
+            channel.setShowBadge(false)
 
             val manager =
                 getSystemService(
@@ -163,49 +167,23 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
 
         if (status == TextToSpeech.SUCCESS) {
 
-            val result =
+            try {
+
                 tts?.setLanguage(
                     Locale("hu", "HU")
                 )
 
-            tts?.setSpeechRate(1.0f)
-            tts?.setPitch(1.0f)
+                tts?.setSpeechRate(1.0f)
+                tts?.setPitch(1.0f)
 
-            if (
-                result == TextToSpeech.LANG_MISSING_DATA ||
-                result == TextToSpeech.LANG_NOT_SUPPORTED
-            ) {
-                // Magyar TTS nem érhető el.
+            } catch (_: Exception) {
             }
-        }
-    }
-
-    private fun speak(message: String) {
-
-        if (message.isBlank()) {
-            return
-        }
-
-        try {
-            tts?.speak(
-                message,
-                TextToSpeech.QUEUE_FLUSH,
-                null,
-                "nova_response"
-            )
-        } catch (_: Exception) {
         }
     }
 
     private fun createRecognizer() {
 
-        try {
-            recognizer?.cancel()
-            recognizer?.destroy()
-        } catch (_: Exception) {
-        }
-
-        recognizer = null
+        destroyRecognizer()
 
         if (
             !SpeechRecognizer.isRecognitionAvailable(
@@ -226,11 +204,11 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
                 override fun onReadyForSpeech(
                     params: Bundle?
                 ) {
-                    recognitionStarting = false
+                    listening = true
                 }
 
                 override fun onBeginningOfSpeech() {
-                    recognitionStarting = false
+                    listening = true
                 }
 
                 override fun onRmsChanged(
@@ -244,17 +222,21 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
                 }
 
                 override fun onEndOfSpeech() {
-                    recognitionStarting = false
+                    listening = false
                 }
 
                 override fun onError(
                     error: Int
                 ) {
 
-                    recognitionStarting = false
+                    listening = false
 
-                    if (running) {
-                        restartRecognition(800)
+                    if (
+                        running &&
+                        !speaking &&
+                        !processingCommand
+                    ) {
+                        scheduleListening(ERROR_DELAY)
                     }
                 }
 
@@ -262,33 +244,36 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
                     results: Bundle?
                 ) {
 
-                    recognitionStarting = false
+                    listening = false
 
                     if (!running) {
                         return
                     }
 
-                    val resultsList =
-                        results?.getStringArrayList(
-                            SpeechRecognizer.RESULTS_RECOGNITION
-                        )
+                    if (speaking || processingCommand) {
+                        return
+                    }
 
                     val heard =
-                        resultsList
+                        results
+                            ?.getStringArrayList(
+                                SpeechRecognizer.RESULTS_RECOGNITION
+                            )
                             ?.firstOrNull()
                             .orEmpty()
 
-                    if (heard.isNotBlank()) {
-                        handleSpeech(heard)
+                    if (heard.isBlank()) {
+                        scheduleListening(LISTEN_DELAY)
+                        return
                     }
 
-                    restartRecognition(600)
+                    processSpeech(heard)
                 }
 
                 override fun onPartialResults(
                     partialResults: Bundle?
                 ) {
-                    // Részleges eredményből nem hajtunk végre parancsot.
+                    // Nem hajtunk végre parancsot részleges eredményből.
                 }
 
                 override fun onEvent(
@@ -300,113 +285,151 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         )
     }
 
-    private fun startListening() {
+    private fun startNova() {
+
+        if (running) {
+            return
+        }
 
         if (
             !SpeechRecognizer.isRecognitionAvailable(
                 applicationContext
             )
         ) {
-
             speak(
                 "A beszédfelismerés nem érhető el ezen a készüléken."
             )
-
             return
         }
 
         running = true
+        listening = false
+        speaking = false
+        processingCommand = false
         novaActivated = false
-        recognitionStarting = false
 
-        restartRecognition(300)
+        scheduleListening(300L)
     }
 
-    private fun restartRecognition(
+    private fun scheduleListening(
         delay: Long
+    ) {
+
+        handler.removeCallbacksAndMessages(null)
+
+        if (!running) {
+            return
+        }
+
+        if (speaking || processingCommand) {
+            return
+        }
+
+        handler.postDelayed({
+
+            if (!running) {
+                return@postDelayed
+            }
+
+            if (speaking || processingCommand) {
+                return@postDelayed
+            }
+
+            startRecognition()
+
+        }, delay)
+    }
+
+    private fun startRecognition() {
+
+        if (!running) {
+            return
+        }
+
+        if (speaking || processingCommand) {
+            return
+        }
+
+        if (listening) {
+            return
+        }
+
+        try {
+
+            recognizer?.cancel()
+
+        } catch (_: Exception) {
+        }
+
+        val recognitionIntent =
+            Intent(
+                RecognizerIntent.ACTION_RECOGNIZE_SPEECH
+            ).apply {
+
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE,
+                    "hu-HU"
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
+                    "hu-HU"
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_PARTIAL_RESULTS,
+                    false
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_MAX_RESULTS,
+                    3
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_CALLING_PACKAGE,
+                    packageName
+                )
+            }
+
+        try {
+
+            recognizer?.startListening(
+                recognitionIntent
+            )
+
+            listening = true
+
+        } catch (_: Exception) {
+
+            listening = false
+
+            scheduleListening(ERROR_DELAY)
+        }
+    }
+
+    private fun processSpeech(
+        raw: String
     ) {
 
         if (!running) {
             return
         }
 
-        if (recognitionStarting) {
+        if (processingCommand) {
             return
         }
 
-        recognitionStarting = true
-
-        handler.postDelayed({
-
-            if (!running) {
-                recognitionStarting = false
-                return@postDelayed
-            }
-
-            try {
-
-                recognizer?.cancel()
-
-                val recognitionIntent =
-                    Intent(
-                        RecognizerIntent.ACTION_RECOGNIZE_SPEECH
-                    ).apply {
-
-                        putExtra(
-                            RecognizerIntent.EXTRA_LANGUAGE,
-                            "hu-HU"
-                        )
-
-                        putExtra(
-                            RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
-                            "hu-HU"
-                        )
-
-                        putExtra(
-                            RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                            RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-                        )
-
-                        putExtra(
-                            RecognizerIntent.EXTRA_PARTIAL_RESULTS,
-                            true
-                        )
-
-                        putExtra(
-                            RecognizerIntent.EXTRA_MAX_RESULTS,
-                            5
-                        )
-
-                        putExtra(
-                            RecognizerIntent.EXTRA_CALLING_PACKAGE,
-                            packageName
-                        )
-                    }
-
-                recognizer?.startListening(
-                    recognitionIntent
-                )
-
-            } catch (_: Exception) {
-
-                recognitionStarting = false
-
-                if (running) {
-                    restartRecognition(1500)
-                }
-            }
-
-        }, delay)
-    }
-
-    private fun handleSpeech(
-        rawSpeech: String
-    ) {
-
         val normalized =
-            MainActivity.normalize(rawSpeech)
+            MainActivity.normalize(raw)
 
         if (normalized.isBlank()) {
+            scheduleListening(LISTEN_DELAY)
             return
         }
 
@@ -416,6 +439,7 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         if (!novaActivated) {
 
             if (!containsNova) {
+                scheduleListening(LISTEN_DELAY)
                 return
             }
 
@@ -426,7 +450,9 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
 
             if (command.isBlank()) {
 
-                speak("Igen?")
+                speakAndResume(
+                    "Igen?"
+                )
 
                 return
             }
@@ -441,7 +467,9 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
 
         if (command.isBlank()) {
 
-            speak("Igen?")
+            speakAndResume(
+                "Igen?"
+            )
 
             return
         }
@@ -456,26 +484,29 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         val normalized =
             MainActivity.normalize(text)
 
-        val wakeWords = listOf(
+        val words = listOf(
             "nova",
-            "nóva",
             "nóva",
             "no va",
             "noa",
             "novaa",
             "novah",
-            "nová",
-            "nóva"
+            "nová"
         )
 
-        for (word in wakeWords) {
+        for (word in words) {
 
-            if (
+            val pattern =
                 Regex(
                     "(^|\\s)" +
                             Regex.escape(word) +
                             "(\\s|$)"
-                ).containsMatchIn(normalized)
+                )
+
+            if (
+                pattern.containsMatchIn(
+                    normalized
+                )
             ) {
                 return true
             }
@@ -491,7 +522,7 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         var result =
             MainActivity.normalize(text)
 
-        val wakeWords = listOf(
+        val words = listOf(
             "nova",
             "nóva",
             "no va",
@@ -501,7 +532,7 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
             "nová"
         )
 
-        for (word in wakeWords) {
+        for (word in words) {
 
             result =
                 result.replace(
@@ -526,79 +557,158 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         command: String
     ) {
 
+        if (!running) {
+            return
+        }
+
+        if (processingCommand) {
+            return
+        }
+
+        processingCommand = true
+
+        stopRecognition()
+
+        handler.postDelayed({
+
+            if (!running) {
+                processingCommand = false
+                return@postDelayed
+            }
+
+            try {
+
+                val result =
+                    CommandRouter.execute(
+                        applicationContext,
+                        command
+                    )
+
+                val response =
+                    when (result.type) {
+
+                        CommandRouter.ResultType.EXECUTED ->
+                            result.response
+
+                        CommandRouter.ResultType.UNKNOWN ->
+                            result.response
+
+                        CommandRouter.ResultType.AMBIGUOUS -> {
+
+                            val options =
+                                result.options.joinToString(
+                                    separator = " vagy "
+                                )
+
+                            if (options.isBlank()) {
+                                result.response
+                            } else {
+                                "${result.response} $options."
+                            }
+                        }
+
+                        CommandRouter.ResultType.CLARIFICATION ->
+                            result.response
+                    }
+
+                speakAndResume(response)
+
+            } catch (_: Exception) {
+
+                speakAndResume(
+                    "Nem sikerült végrehajtanom a parancsot."
+                )
+            }
+
+        }, COMMAND_DELAY)
+    }
+
+    private fun speakAndResume(
+        message: String
+    ) {
+
+        if (!running) {
+            return
+        }
+
+        processingCommand = false
+        stopRecognition()
+
+        if (message.isBlank()) {
+            scheduleListening(LISTEN_DELAY)
+            return
+        }
+
+        speaking = true
+
         try {
 
-            val result =
-                CommandRouter.execute(
-                    applicationContext,
-                    command
-                )
-
-            when (result.type) {
-
-                CommandRouter.ResultType.EXECUTED -> {
-
-                    speak(
-                        result.response
-                    )
-                }
-
-                CommandRouter.ResultType.UNKNOWN -> {
-
-                    speak(
-                        result.response
-                    )
-                }
-
-                CommandRouter.ResultType.AMBIGUOUS -> {
-
-                    val options =
-                        result.options.joinToString(
-                            separator = " vagy "
-                        )
-
-                    if (options.isBlank()) {
-
-                        speak(
-                            result.response
-                        )
-
-                    } else {
-
-                        speak(
-                            "${result.response} $options."
-                        )
-                    }
-                }
-
-                CommandRouter.ResultType.CLARIFICATION -> {
-
-                    speak(
-                        result.response
-                    )
-                }
-            }
+            tts?.speak(
+                message,
+                TextToSpeech.QUEUE_FLUSH,
+                null,
+                "nova_response"
+            )
 
         } catch (_: Exception) {
 
-            speak(
-                "Nem sikerült végrehajtanom a parancsot."
-            )
+            speaking = false
+
+            if (running) {
+                scheduleListening(LISTEN_DELAY)
+            }
+
+            return
         }
+
+        handler.postDelayed({
+
+            speaking = false
+
+            if (running) {
+                scheduleListening(400L)
+            }
+
+        }, calculateSpeechDelay(message))
     }
 
-    private fun stopListening() {
+    private fun calculateSpeechDelay(
+        text: String
+    ): Long {
 
-        running = false
-        novaActivated = false
-        recognitionStarting = false
+        val length =
+            text.length.coerceIn(
+                1,
+                200
+            )
 
-        handler.removeCallbacksAndMessages(null)
+        return (
+                700L +
+                        length * 45L
+                ).coerceAtMost(7000L)
+    }
+
+    private fun stopRecognition() {
+
+        listening = false
 
         try {
             recognizer?.cancel()
         } catch (_: Exception) {
         }
+    }
+
+    private fun stopNova() {
+
+        running = false
+        listening = false
+        speaking = false
+        processingCommand = false
+        novaActivated = false
+
+        handler.removeCallbacksAndMessages(null)
+
+        stopRecognition()
 
         try {
             tts?.stop()
@@ -606,13 +716,7 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    override fun onDestroy() {
-
-        running = false
-        novaActivated = false
-        recognitionStarting = false
-
-        handler.removeCallbacksAndMessages(null)
+    private fun destroyRecognizer() {
 
         try {
             recognizer?.cancel()
@@ -625,6 +729,14 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         }
 
         recognizer = null
+        listening = false
+    }
+
+    override fun onDestroy() {
+
+        stopNova()
+
+        destroyRecognizer()
 
         try {
             tts?.stop()
