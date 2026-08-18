@@ -1,64 +1,55 @@
 package hu.novamobile
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
-import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
 import java.util.Locale
 
-class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
+class NovaVoiceService : Service(), RecognitionListener {
 
     companion object {
-        const val ACTION_START = "hu.novamobile.START_VOICE"
-        const val ACTION_STOP = "hu.novamobile.STOP_VOICE"
+        const val ACTION_START = "hu.novamobile.NOVA_START"
+        const val ACTION_STOP = "hu.novamobile.NOVA_STOP"
 
         private const val CHANNEL_ID = "nova_voice_channel"
-        private const val NOTIFICATION_ID = 1001
+        private const val NOTIFICATION_ID = 3001
 
-        private const val LISTEN_DELAY = 500L
-        private const val ERROR_DELAY = 1200L
-        private const val COMMAND_DELAY = 700L
+        private const val WAKE_WORD = "nova"
     }
 
-    private val handler = Handler(Looper.getMainLooper())
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var speechIntent: Intent? = null
+    private var textToSpeech: TextToSpeech? = null
 
-    private var recognizer: SpeechRecognizer? = null
-    private var tts: TextToSpeech? = null
-
-    private var running = false
-    private var listening = false
-    private var speaking = false
-    private var processingCommand = false
-    private var novaActivated = false
+    private var isListening = false
+    private var isSpeaking = false
+    private var shouldListen = false
 
     override fun onCreate() {
         super.onCreate()
 
         createNotificationChannel()
 
-        startForeground(
-            NOTIFICATION_ID,
-            createNotification()
-        )
+        textToSpeech = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                textToSpeech?.language = Locale("hu", "HU")
+            }
+        }
 
-        tts = TextToSpeech(
-            applicationContext,
-            this
-        )
-
-        createRecognizer()
+        setupSpeechRecognizer()
     }
 
     override fun onStartCommand(
@@ -69,302 +60,60 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
 
         when (intent?.action) {
 
-            ACTION_START -> {
-                startNova()
-            }
-
             ACTION_STOP -> {
-                stopNova()
+                stopListening()
                 stopSelf()
+                return START_NOT_STICKY
+            }
+
+            ACTION_START -> {
+                startForeground(
+                    NOTIFICATION_ID,
+                    createNotification()
+                )
+
+                shouldListen = true
+                startListening()
+            }
+
+            else -> {
+                startForeground(
+                    NOTIFICATION_ID,
+                    createNotification()
+                )
+
+                shouldListen = true
+                startListening()
             }
         }
 
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
-    private fun createNotificationChannel() {
+    // ============================================================
+    // SPEECH RECOGNIZER
+    // ============================================================
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    private fun setupSpeechRecognizer() {
 
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "NOVA hangvezérlés",
-                NotificationManager.IMPORTANCE_LOW
-            )
-
-            channel.description =
-                "NOVA háttérben futó hangvezérlése"
-
-            channel.setShowBadge(false)
-
-            val manager =
-                getSystemService(
-                    Context.NOTIFICATION_SERVICE
-                ) as NotificationManager
-
-            manager.createNotificationChannel(channel)
-        }
-    }
-
-    private fun createNotification(): Notification {
-
-        val openIntent =
-            Intent(
-                this,
-                MainActivity::class.java
-            )
-
-        val pendingIntent =
-            PendingIntent.getActivity(
-                this,
-                0,
-                openIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or
-                        PendingIntent.FLAG_IMMUTABLE
-            )
-
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
-            Notification.Builder(
-                this,
-                CHANNEL_ID
-            )
-                .setContentTitle("NOVA aktív")
-                .setContentText(
-                    "NOVA hangvezérlés fut."
-                )
-                .setSmallIcon(
-                    android.R.drawable.ic_btn_speak_now
-                )
-                .setOngoing(true)
-                .setContentIntent(pendingIntent)
-                .setCategory(
-                    Notification.CATEGORY_SERVICE
-                )
-                .build()
-
-        } else {
-
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-                .setContentTitle("NOVA aktív")
-                .setContentText(
-                    "NOVA hangvezérlés fut."
-                )
-                .setSmallIcon(
-                    android.R.drawable.ic_btn_speak_now
-                )
-                .setOngoing(true)
-                .setContentIntent(pendingIntent)
-                .setCategory(
-                    Notification.CATEGORY_SERVICE
-                )
-                .build()
-        }
-    }
-
-    override fun onInit(status: Int) {
-
-        if (status == TextToSpeech.SUCCESS) {
-
-            try {
-
-                tts?.setLanguage(
-                    Locale("hu", "HU")
-                )
-
-                tts?.setSpeechRate(1.0f)
-                tts?.setPitch(1.0f)
-
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    private fun createRecognizer() {
-
-        destroyRecognizer()
-
-        if (
-            !SpeechRecognizer.isRecognitionAvailable(
-                applicationContext
-            )
-        ) {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             return
         }
 
-        recognizer =
-            SpeechRecognizer.createSpeechRecognizer(
-                applicationContext
-            )
+        speechRecognizer =
+            SpeechRecognizer.createSpeechRecognizer(this)
 
-        recognizer?.setRecognitionListener(
-            object : RecognitionListener {
+        speechRecognizer?.setRecognitionListener(this)
 
-                override fun onReadyForSpeech(
-                    params: Bundle?
-                ) {
-                    listening = true
-                }
-
-                override fun onBeginningOfSpeech() {
-                    listening = true
-                }
-
-                override fun onRmsChanged(
-                    rmsdB: Float
-                ) {
-                }
-
-                override fun onBufferReceived(
-                    buffer: ByteArray?
-                ) {
-                }
-
-                override fun onEndOfSpeech() {
-                    listening = false
-                }
-
-                override fun onError(
-                    error: Int
-                ) {
-
-                    listening = false
-
-                    if (
-                        running &&
-                        !speaking &&
-                        !processingCommand
-                    ) {
-                        scheduleListening(ERROR_DELAY)
-                    }
-                }
-
-                override fun onResults(
-                    results: Bundle?
-                ) {
-
-                    listening = false
-
-                    if (!running) {
-                        return
-                    }
-
-                    if (speaking || processingCommand) {
-                        return
-                    }
-
-                    val heard =
-                        results
-                            ?.getStringArrayList(
-                                SpeechRecognizer.RESULTS_RECOGNITION
-                            )
-                            ?.firstOrNull()
-                            .orEmpty()
-
-                    if (heard.isBlank()) {
-                        scheduleListening(LISTEN_DELAY)
-                        return
-                    }
-
-                    processSpeech(heard)
-                }
-
-                override fun onPartialResults(
-                    partialResults: Bundle?
-                ) {
-                    // Nem hajtunk végre parancsot részleges eredményből.
-                }
-
-                override fun onEvent(
-                    eventType: Int,
-                    params: Bundle?
-                ) {
-                }
-            }
-        )
-    }
-
-    private fun startNova() {
-
-        if (running) {
-            return
-        }
-
-        if (
-            !SpeechRecognizer.isRecognitionAvailable(
-                applicationContext
-            )
-        ) {
-            speak(
-                "A beszédfelismerés nem érhető el ezen a készüléken."
-            )
-            return
-        }
-
-        running = true
-        listening = false
-        speaking = false
-        processingCommand = false
-        novaActivated = false
-
-        scheduleListening(300L)
-    }
-
-    private fun scheduleListening(
-        delay: Long
-    ) {
-
-        handler.removeCallbacksAndMessages(null)
-
-        if (!running) {
-            return
-        }
-
-        if (speaking || processingCommand) {
-            return
-        }
-
-        handler.postDelayed({
-
-            if (!running) {
-                return@postDelayed
-            }
-
-            if (speaking || processingCommand) {
-                return@postDelayed
-            }
-
-            startRecognition()
-
-        }, delay)
-    }
-
-    private fun startRecognition() {
-
-        if (!running) {
-            return
-        }
-
-        if (speaking || processingCommand) {
-            return
-        }
-
-        if (listening) {
-            return
-        }
-
-        try {
-
-            recognizer?.cancel()
-
-        } catch (_: Exception) {
-        }
-
-        val recognitionIntent =
+        speechIntent =
             Intent(
                 RecognizerIntent.ACTION_RECOGNIZE_SPEECH
             ).apply {
+
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                )
 
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE,
@@ -377,18 +126,13 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
                 )
 
                 putExtra(
-                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-                )
-
-                putExtra(
                     RecognizerIntent.EXTRA_PARTIAL_RESULTS,
                     false
                 )
 
                 putExtra(
                     RecognizerIntent.EXTRA_MAX_RESULTS,
-                    3
+                    5
                 )
 
                 putExtra(
@@ -396,116 +140,551 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
                     packageName
                 )
             }
+    }
+
+    private fun startListening() {
+
+        if (!shouldListen) {
+            return
+        }
+
+        if (isSpeaking) {
+            return
+        }
+
+        if (isListening) {
+            return
+        }
+
+        if (
+            ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+
+        val recognizer =
+            speechRecognizer ?: run {
+                setupSpeechRecognizer()
+                speechRecognizer
+            } ?: return
+
+        val intent =
+            speechIntent ?: return
 
         try {
 
-            recognizer?.startListening(
-                recognitionIntent
-            )
+            isListening = true
 
-            listening = true
+            recognizer.startListening(intent)
 
         } catch (_: Exception) {
 
-            listening = false
+            isListening = false
 
-            scheduleListening(ERROR_DELAY)
+            restartListening()
         }
     }
 
-    private fun processSpeech(
-        raw: String
+    private fun stopListening() {
+
+        shouldListen = false
+        isListening = false
+
+        try {
+            speechRecognizer?.stopListening()
+        } catch (_: Exception) {
+        }
+
+        try {
+            speechRecognizer?.cancel()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun restartListening() {
+
+        if (!shouldListen) {
+            return
+        }
+
+        isListening = false
+
+        android.os.Handler(
+            mainLooper
+        ).postDelayed(
+            {
+                if (shouldListen && !isSpeaking) {
+                    startListening()
+                }
+            },
+            500
+        )
+    }
+
+    // ============================================================
+    // FELISMERÉS
+    // ============================================================
+
+    override fun onResults(results: Bundle?) {
+
+        isListening = false
+
+        if (!shouldListen) {
+            return
+        }
+
+        val recognizedText =
+            results
+                ?.getStringArrayList(
+                    SpeechRecognizer.RESULTS_RECOGNITION
+                )
+                ?.firstOrNull()
+                ?.trim()
+                ?: ""
+
+        if (recognizedText.isNotBlank()) {
+
+            handleSpeech(
+                recognizedText
+            )
+        } else {
+
+            restartListening()
+        }
+    }
+
+    private fun handleSpeech(
+        text: String
     ) {
 
-        if (!running) {
-            return
-        }
-
-        if (processingCommand) {
-            return
-        }
-
         val normalized =
-            MainActivity.normalize(raw)
+            normalize(text)
 
-        if (normalized.isBlank()) {
-            scheduleListening(LISTEN_DELAY)
+        // --------------------------------------------------------
+        // CSAK AKKOR REAGÁL, HA ELHANGZIK A "NOVA"
+        // --------------------------------------------------------
+
+        if (!containsWakeWord(normalized)) {
+
+            restartListening()
             return
         }
 
-        val containsNova =
-            containsWakeWord(normalized)
+        // --------------------------------------------------------
+        // WAKE WORD KISZEDÉSE
+        // --------------------------------------------------------
 
-        if (!novaActivated) {
-
-            if (!containsNova) {
-                scheduleListening(LISTEN_DELAY)
-                return
-            }
-
-            novaActivated = true
-
-            val command =
-                removeWakeWord(normalized)
-
-            if (command.isBlank()) {
-
-                speakAndResume(
-                    "Igen?"
-                )
-
-                return
-            }
-
-            executeCommand(command)
-
-            return
-        }
-
-        val command =
+        val commandText =
             removeWakeWord(normalized)
 
-        if (command.isBlank()) {
+        // Csak annyit mondott:
+        // "Nova"
 
-            speakAndResume(
-                "Igen?"
+        if (commandText.isBlank()) {
+
+            speak(
+                "Itt vagyok."
             )
 
             return
         }
 
-        executeCommand(command)
+        executeCommand(
+            commandText
+        )
     }
+
+    // ============================================================
+    // PARANCS VÉGREHAJTÁS
+    // ============================================================
+
+    private fun executeCommand(
+        commandText: String
+    ) {
+
+        try {
+
+            val result =
+                CommandRouter.execute(
+                    this,
+                    commandText
+                )
+
+            when (result.type) {
+
+                CommandRouter.ResultType.EXECUTED -> {
+
+                    speak(
+                        result.response
+                    )
+                }
+
+                CommandRouter.ResultType.AMBIGUOUS -> {
+
+                    val options =
+                        result.options.joinToString(
+                            " vagy "
+                        )
+
+                    speak(
+                        if (options.isNotBlank()) {
+                            "${result.response} $options"
+                        } else {
+                            result.response
+                        }
+                    )
+                }
+
+                CommandRouter.ResultType.CLARIFICATION -> {
+
+                    val option =
+                        result.options.firstOrNull()
+
+                    speak(
+                        if (option != null) {
+                            "${result.response} $option"
+                        } else {
+                            result.response
+                        }
+                    )
+                }
+
+                CommandRouter.ResultType.UNKNOWN -> {
+
+                    speak(
+                        result.response
+                    )
+                }
+            }
+
+        } catch (e: Exception) {
+
+            speak(
+                "Hiba történt a parancs végrehajtásakor."
+            )
+        }
+    }
+
+    // ============================================================
+    // TTS
+    // ============================================================
+
+    private fun speak(
+        text: String
+    ) {
+
+        if (text.isBlank()) {
+            restartListening()
+            return
+        }
+
+        val tts =
+            textToSpeech ?: run {
+                restartListening()
+                return
+            }
+
+        isSpeaking = true
+
+        try {
+
+            tts.speak(
+                text,
+                TextToSpeech.QUEUE_FLUSH,
+                null,
+                "NOVA_RESPONSE"
+            )
+
+        } catch (_: Exception) {
+
+            isSpeaking = false
+            restartListening()
+        }
+    }
+
+    // ============================================================
+    // TTS CALLBACK KEZELÉS
+    // ============================================================
+
+    private fun finishSpeaking() {
+
+        isSpeaking = false
+
+        if (shouldListen) {
+            restartListening()
+        }
+    }
+
+    // ============================================================
+    // NORMALIZÁLÁS
+    // ============================================================
+
+    private fun normalize(
+        input: String
+    ): String {
+
+        return input
+            .lowercase(Locale("hu", "HU"))
+            .replace(
+                "á",
+                "a"
+            )
+            .replace(
+                "é",
+                "e"
+            )
+            .replace(
+                "í",
+                "i"
+            )
+            .replace(
+                "ó",
+                "o"
+            )
+            .replace(
+                "ö",
+                "o"
+            )
+            .replace(
+                "ő",
+                "o"
+            )
+            .replace(
+                "ú",
+                "u"
+            )
+            .replace(
+                "ü",
+                "u"
+            )
+            .replace(
+                "ű",
+                "u"
+            )
+            .replace(
+                Regex("[^a-z0-9 ]"),
+                " "
+            )
+            .replace(
+                Regex("\\s+"),
+                " "
+            )
+            .trim()
+    }
+
+    // ============================================================
+    // 100+ MEGSZÓLÍTÁS / WAKE WORD
+    // ============================================================
 
     private fun containsWakeWord(
         text: String
     ): Boolean {
 
-        val normalized =
-            MainActivity.normalize(text)
+        val wakeWords =
+            listOf(
 
-        val words = listOf(
-            "nova",
-            "nóva",
-            "no va",
-            "noa",
-            "novaa",
-            "novah",
-            "nová"
-        )
+                "nova",
+                "nóva",
+                "no va",
+                "noova",
+                "novaa",
+                "novah",
+                "novi",
+                "novaa",
+                "nov",
+                "noba",
+                "nóva",
+                "noba",
+                "nava",
+                "nora",
+                "noa",
+                "noya",
+                "nóva",
+
+                "nova gyere",
+                "nova figyelj",
+                "nova hallasz",
+                "nova hallod",
+                "nova itt vagy",
+                "nova vagy ott",
+                "nova jelentkezz",
+                "nova figyelsz",
+                "nova hallgatsz",
+                "nova ébreszto",
+                "nova ébresztő",
+                "nova indulj",
+                "nova kezdj",
+                "nova indul",
+                "nova aktiv",
+                "nova aktiválás",
+                "nova aktivizal",
+                "nova aktivizál",
+                "nova start",
+                "nova startolj",
+                "nova kezdes",
+                "nova kezdés",
+                "nova segíts",
+                "nova segits",
+                "nova segits nekem",
+                "nova segíts nekem",
+                "nova segítség",
+                "nova segitseg",
+                "nova figyelj ram",
+                "nova figyelj rám",
+                "nova hallgass",
+                "nova hallgass meg",
+                "nova figyelj ide",
+                "nova ide",
+                "nova itt",
+                "nova most",
+                "nova hé",
+                "nova hej",
+                "nova hey",
+                "nova hello",
+                "nova szia",
+                "nova cső",
+                "nova cso",
+                "nova csá",
+                "nova csa",
+                "nova te",
+                "nova te ott",
+                "nova chatbot",
+                "nova asszisztens",
+                "nova assistant",
+                "nova ai",
+                "nova rendszer",
+                "nova rendszerem",
+                "nova program",
+                "nova alkalmazas",
+                "nova alkalmazás",
+                "nova app",
+                "nova hang",
+                "nova hangasszisztens",
+                "nova hang asszisztens",
+                "nova voice",
+                "nova voice assistant",
+                "nova computer",
+                "nova gep",
+                "nova gép",
+                "nova telefon",
+                "nova mobil",
+                "nova mobile",
+                "nova android",
+                "nova androidos",
+                "nova figyelsz ram",
+                "nova figyelsz rám",
+                "nova hallasz engem",
+                "nova hallod engem",
+                "nova hallasz engem",
+                "nova itt vagy nekem",
+                "nova itt vagy meg",
+                "nova ott vagy",
+                "nova vagy",
+                "nova vagy ott",
+                "nova el",
+                "nova működj",
+                "nova mukodj",
+                "nova működj már",
+                "nova mukodj mar",
+                "nova kelj fel",
+                "nova ebredj",
+                "nova ébredj",
+                "nova ébredj fel",
+                "nova ebredj fel",
+                "nova ébren vagy",
+                "nova ebren vagy",
+                "nova felébredtél",
+                "nova felebredtel",
+                "nova online",
+                "nova online vagy",
+                "nova rendszer online",
+                "nova bekapcsol",
+                "nova kapcsold be magad",
+                "nova aktiv vagy",
+                "nova aktiv vagy",
+                "nova készen állsz",
+                "nova keszen allsz",
+                "nova készen állsz",
+                "nova ready",
+                "nova ready vagy",
+                "nova wake up",
+                "nova wakeup",
+                "nova wake up now",
+                "nova start",
+                "nova start up",
+                "nova indulas",
+                "nova indulás",
+                "nova go",
+                "nova go go",
+                "nova respond",
+                "nova response",
+                "nova válaszolj",
+                "nova valaszolj",
+                "nova válasz",
+                "nova valasz",
+                "nova beszélj",
+                "nova beszelj",
+                "nova beszélj hozzám",
+                "nova beszelj hozzam",
+                "nova beszélj velem",
+                "nova beszelj velem",
+                "nova szólj",
+                "nova szolj",
+                "nova mondj valamit",
+                "nova mondj valamit nekem",
+                "nova kommunikáció",
+                "nova kommunikacio",
+                "nova kapcsolat",
+                "nova kapcsolatba",
+                "nova kapcsolódj",
+                "nova kapcsolodj",
+                "nova figyelem",
+                "nova figyelem ide",
+                "nova figyelmet",
+                "nova rám figyelj",
+                "nova ram figyelj",
+                "nova hallgass ide",
+                "nova hallgass ram",
+                "nova hallgass rám"
+            )
+
+        // Normál "nova" keresés
+        if (
+            text == "nova" ||
+            text.startsWith("nova ") ||
+            text.contains(" nova ")
+        ) {
+            return true
+        }
+
+        // Fuzzy wake-word felismerés
+        val words =
+            text.split(" ")
 
         for (word in words) {
 
-            val pattern =
-                Regex(
-                    "(^|\\s)" +
-                            Regex.escape(word) +
-                            "(\\s|$)"
-                )
+            if (word.length < 2) {
+                continue
+            }
 
             if (
-                pattern.containsMatchIn(
-                    normalized
+                fuzzySimilarity(
+                    word,
+                    "nova"
+                ) >= 0.65
+            ) {
+                return true
+            }
+        }
+
+        for (wakeWord in wakeWords) {
+
+            if (
+                text.contains(
+                    normalize(wakeWord)
                 )
             ) {
                 return true
@@ -519,31 +698,47 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
         text: String
     ): String {
 
-        var result =
-            MainActivity.normalize(text)
+        var result = text
 
-        val words = listOf(
-            "nova",
-            "nóva",
-            "no va",
-            "noa",
-            "novaa",
-            "novah",
-            "nová"
-        )
+        result =
+            result.replace(
+                Regex(
+                    "\\bnova\\b"
+                ),
+                " "
+            )
 
-        for (word in words) {
+        result =
+            result.replace(
+                Regex(
+                    "\\bnoba\\b"
+                ),
+                " "
+            )
 
-            result =
-                result.replace(
-                    Regex(
-                        "(^|\\s)" +
-                                Regex.escape(word) +
-                                "(?=\\s|$)"
-                    ),
-                    " "
-                )
-        }
+        result =
+            result.replace(
+                Regex(
+                    "\\bnava\\b"
+                ),
+                " "
+            )
+
+        result =
+            result.replace(
+                Regex(
+                    "\\bnora\\b"
+                ),
+                " "
+            )
+
+        result =
+            result.replace(
+                Regex(
+                    "\\bno va\\b"
+                ),
+                " "
+            )
 
         return result
             .replace(
@@ -553,202 +748,142 @@ class NovaVoiceService : Service(), TextToSpeech.OnInitListener {
             .trim()
     }
 
-    private fun executeCommand(
-        command: String
-    ) {
+    // ============================================================
+    // NOTIFICATION
+    // ============================================================
 
-        if (!running) {
-            return
-        }
+    private fun createNotificationChannel() {
 
-        if (processingCommand) {
-            return
-        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
 
-        processingCommand = true
+            val channel =
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "NOVA hangasszisztens",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
 
-        stopRecognition()
+                    description =
+                        "NOVA hangfelismerési szolgáltatás"
 
-        handler.postDelayed({
+                    setShowBadge(false)
+                }
 
-            if (!running) {
-                processingCommand = false
-                return@postDelayed
-            }
-
-            try {
-
-                val result =
-                    CommandRouter.execute(
-                        applicationContext,
-                        command
-                    )
-
-                val response =
-                    when (result.type) {
-
-                        CommandRouter.ResultType.EXECUTED ->
-                            result.response
-
-                        CommandRouter.ResultType.UNKNOWN ->
-                            result.response
-
-                        CommandRouter.ResultType.AMBIGUOUS -> {
-
-                            val options =
-                                result.options.joinToString(
-                                    separator = " vagy "
-                                )
-
-                            if (options.isBlank()) {
-                                result.response
-                            } else {
-                                "${result.response} $options."
-                            }
-                        }
-
-                        CommandRouter.ResultType.CLARIFICATION ->
-                            result.response
-                    }
-
-                speakAndResume(response)
-
-            } catch (_: Exception) {
-
-                speakAndResume(
-                    "Nem sikerült végrehajtanom a parancsot."
+            val manager =
+                getSystemService(
+                    NotificationManager::class.java
                 )
-            }
 
-        }, COMMAND_DELAY)
+            manager.createNotificationChannel(
+                channel
+            )
+        }
     }
 
-    private fun speakAndResume(
-        message: String
+    private fun createNotification(): Notification {
+
+        return NotificationCompat
+            .Builder(
+                this,
+                CHANNEL_ID
+            )
+            .setContentTitle(
+                "NOVA"
+            )
+            .setContentText(
+                "NOVA hangasszisztens aktív"
+            )
+            .setSmallIcon(
+                android.R.drawable.ic_btn_speak_now
+            )
+            .setOngoing(true)
+            .setSilent(true)
+            .build()
+    }
+
+    // ============================================================
+    // RECOGNITION LISTENER
+    // ============================================================
+
+    override fun onReadyForSpeech(
+        params: Bundle?
+    ) {
+    }
+
+    override fun onBeginningOfSpeech() {
+    }
+
+    override fun onRmsChanged(
+        rmsdB: Float
+    ) {
+    }
+
+    override fun onBufferReceived(
+        buffer: ByteArray?
+    ) {
+    }
+
+    override fun onEndOfSpeech() {
+
+        isListening = false
+
+        if (shouldListen && !isSpeaking) {
+            restartListening()
+        }
+    }
+
+    override fun onError(
+        error: Int
     ) {
 
-        if (!running) {
+        isListening = false
+
+        if (!shouldListen) {
             return
         }
 
-        processingCommand = false
-        stopRecognition()
-
-        if (message.isBlank()) {
-            scheduleListening(LISTEN_DELAY)
-            return
-        }
-
-        speaking = true
-
-        try {
-
-            tts?.speak(
-                message,
-                TextToSpeech.QUEUE_FLUSH,
-                null,
-                "nova_response"
-            )
-
-        } catch (_: Exception) {
-
-            speaking = false
-
-            if (running) {
-                scheduleListening(LISTEN_DELAY)
-            }
-
-            return
-        }
-
-        handler.postDelayed({
-
-            speaking = false
-
-            if (running) {
-                scheduleListening(400L)
-            }
-
-        }, calculateSpeechDelay(message))
+        restartListening()
     }
 
-    private fun calculateSpeechDelay(
-        text: String
-    ): Long {
-
-        val length =
-            text.length.coerceIn(
-                1,
-                200
-            )
-
-        return (
-                700L +
-                        length * 45L
-                ).coerceAtMost(7000L)
+    override fun onPartialResults(
+        partialResults: Bundle?
+    ) {
     }
 
-    private fun stopRecognition() {
-
-        listening = false
-
-        try {
-            recognizer?.cancel()
-        } catch (_: Exception) {
-        }
+    override fun onEvent(
+        eventType: Int,
+        params: Bundle?
+    ) {
     }
 
-    private fun stopNova() {
-
-        running = false
-        listening = false
-        speaking = false
-        processingCommand = false
-        novaActivated = false
-
-        handler.removeCallbacksAndMessages(null)
-
-        stopRecognition()
-
-        try {
-            tts?.stop()
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun destroyRecognizer() {
-
-        try {
-            recognizer?.cancel()
-        } catch (_: Exception) {
-        }
-
-        try {
-            recognizer?.destroy()
-        } catch (_: Exception) {
-        }
-
-        recognizer = null
-        listening = false
-    }
+    // ============================================================
+    // SERVICE LIFECYCLE
+    // ============================================================
 
     override fun onDestroy() {
 
-        stopNova()
-
-        destroyRecognizer()
+        shouldListen = false
+        isListening = false
 
         try {
-            tts?.stop()
+            speechRecognizer?.cancel()
         } catch (_: Exception) {
         }
 
         try {
-            tts?.shutdown()
+            speechRecognizer?.destroy()
         } catch (_: Exception) {
         }
 
-        tts = null
+        speechRecognizer = null
+
+        try {
+            textToSpeech?.stop()
+            textToSpeech?.shutdown()
+        } catch (_: Exception) {
+        }
+
+        textToSpeech = null
 
         super.onDestroy()
     }
